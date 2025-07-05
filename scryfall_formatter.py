@@ -1,159 +1,200 @@
+import enum
+from uu import Error
 import scrython
-import imageio
-import requests
-import time
-import config
+import imageio.v3 as imageio
+import replicate
+import os
 import numpy as np
-from numpy.fft import fft2, ifft2, fftshift, ifftshift
-from skimage.transform import resize
+
+# Directory used for caching upscaled images to avoid re-upscaling when we just want to re-format
+CACHE_DIR = "imgcache"
+# Directory used for storing formatted images (i.e. upscaled and copyright removed)
+FORMATTED_DIR = "formatted"
+
+# ! DO NOT TOUCH. Redacting the copyright ultimately depend on these numbers
+# See PNG output size at https://scryfall.com/docs/api/images
+SCRYFALL_BASE_SIZE = (745, 1040)
+
+# We upscale SCRYFALL_BASE_SIZE by x2 which results in a 600dpi image at 2.5" x 3.5" (596dpi to be exact)
+# If you want more DPI you might need to change this number to 4 (the upscaling model does not support x3)
+UPSCALE_FACTOR = 2
+
+# No need to touch
+DEBUG = False
 
 
-def process_card(cardname):
-    time.sleep(0.05)
+class CardFrame(enum.Enum):
+    MODERN = 1
 
-    # If the card specifies which set to retrieve the scan from, do that
-    try:
-        pipe_idx = cardname.index("|")
-        query = cardname[0:pipe_idx] + " set=" + cardname[pipe_idx+1:]
+    @classmethod
+    def from_card(cls, card):
+        card_frame = card["frame"]
+        if card_frame == "2015":
+            return CardFrame.MODERN
+        else:
+            raise Error(f"Frame {card_frame} nor supported")
+
+
+class CardType(enum.Enum):
+    CREATURE = 1
+    PLANESWALKER = 2
+    OTHER = 3
+
+    @classmethod
+    def from_card(cls, card):
+        if "power" and "toughness" in card:
+            return CardType.CREATURE
+        elif "loyalty" in card:
+            return CardType.PLANESWALKER
+        else:
+            return CardType.OTHER
+
+
+class RedactBoxType(enum.Enum):
+    MODERN_COPYRIGHT_DEFAULT = (430, 700, 970, 1040)
+    MODERN_COPYRIGHT_CREATURE = (430, 700, 990, 1040)
+    MODERN_COPYRIGHT_CREATURE_EXTRA_UNIVERSES_BEYOND = (430, 575, 970, 1040)
+    MODERN_COPYRIGHT_PLANESWALKER = (430, 700, 990, 1040)
+
+    def redactBox(self) -> tuple:
+        return tuple([i * UPSCALE_FACTOR for i in self.value])
+
+
+def search_and_process_card(query):
+    query = query.strip()
+
+    # Always need to query Scryfall to get the card metadata
+    if ":" or "=" in query:
         card = scrython.cards.Search(q=query).data()[0]
-        print("Processing: " + cardname + ", set: " + cardname[pipe_idx+1:])
-    except (ValueError, scrython.foundation.ScryfallError):
-        card = scrython.cards.Named(fuzzy=cardname).scryfallJson
-        print("Processing: " + cardname)
+    else:
+        card = scrython.cards.Named(fuzzy=query).scryfallJson
 
-    cardname = card["name"].replace("//", "&")  # should work on macOS & windows now
-    r = requests.post(
-        "https://api.deepai.org/api/waifu2x",
-        data={
-            'image': card["image_uris"]['large'],
-        },
-        headers={'api-key': config.TOKEN}
+    if "card_faces" in card:
+        for face_number, face_card in enumerate(card["card_faces"]):
+            process_card(
+                card=card,
+                frame=CardFrame.from_card(card),
+                type=CardType.from_card(face_card),
+                image_uris=face_card["image_uris"],
+                face_number=face_number,
+            )
+    else:
+        process_card(
+            card=card,
+            frame=CardFrame.from_card(card),
+            type=CardType.from_card(card),
+            image_uris=card["image_uris"],
+            face_number=None,
+        )
+
+
+def process_card(card, frame, type, image_uris, face_number=None):
+    # Using / in image names does not play were well with Linux
+    cardname = f"{card['name'].replace('//', '&')}#{card['set'].upper()}#{(card['collector_number'])}"
+    if face_number is not None:
+        cardname += f"#face{face_number + 1}"
+    print(f"[[{cardname}]] Found card: {card['scryfall_uri']}")
+
+    if DEBUG:
+        debug_path = os.path.join(CACHE_DIR, cardname + "_scryfall_original" + ".png")
+        imageio.imwrite(debug_path, imageio.imread(image_uris["png"]))
+
+    formatted_path = os.path.join(FORMATTED_DIR, cardname + ".png")
+    cached_path = os.path.join(CACHE_DIR, cardname + ".png")
+
+    if os.path.exists(formatted_path):
+        print(f"[[{cardname}]] Already formatted")
+        return
+    elif os.path.exists(cached_path):
+        print(f"[[{cardname}]] Using cached upscaled image, reformatting...")
+        im = imageio.imread(cached_path)
+    else:
+        # You can change this model and upscale_factor if you want, but then make sure that the upscaling
+        # is an integer (x2, x3, x4) so the code for redacting the copyright keeps working
+        print(f"[[{cardname}]] No cached image found, upscaling and reformatting...")
+        input = {
+            "image": image_uris["png"],
+            "enhance_model": "CGI",
+            "upscale_factor": f"{UPSCALE_FACTOR}x",
+            "face_enhancement": False,
+            "output_format": "png",
+        }
+        output = replicate.run("topazlabs/image-upscale", input=input)
+        output_url = output.url
+        im = imageio.imread(output_url)
+        imageio.imwrite(cached_path, im.astype(np.uint8))
+        print(f"[[{cardname}]] Upscaled image saved to cache")
+
+    # Pick a "band" from the border of the card to use as the border colour
+    bordercolour = np.median(
+        im[(im.shape[0] - 32) :, 200 : (im.shape[1] - 200)], axis=(0, 1)
     )
-    output_url = r.json()['output_url']
-    im = imageio.imread(output_url)
 
-    # Read in filter image
-    filterimage = np.copy(imageio.imread("./filterimagenew.png"))
+    # Remove copyright line
+    match frame:
+        case CardFrame.MODERN:
+            match type:
+                case CardType.CREATURE:
+                    box = RedactBoxType.MODERN_COPYRIGHT_CREATURE.redactBox()
+                    # Universes Beyond cards have an extra copyright line which is shifted
+                    # depending on the type of the card
+                    box_ub = (
+                        RedactBoxType.MODERN_COPYRIGHT_CREATURE_EXTRA_UNIVERSES_BEYOND.redactBox()
+                    )
+                case CardType.PLANESWALKER:
+                    box = RedactBoxType.MODERN_COPYRIGHT_PLANESWALKER.redactBox()
+                    box_ub = None
+                case CardType.OTHER:
+                    box = RedactBoxType.MODERN_COPYRIGHT_DEFAULT.redactBox()
+                    box_ub = None
 
-    # Resize filter to shape of input image
-    filterimage = resize(filterimage, [im.shape[0], im.shape[1]], anti_aliasing=True, mode="edge")
-
-    # Initialise arrays
-    im_filtered = np.zeros(im.shape, dtype=np.complex_)
-    im_recon = np.zeros(im.shape, dtype=np.float_)
-
-    # Apply filter to each RGB channel individually
-    for i in range(0, 3):
-        im_filtered[:, :, i] = np.multiply(fftshift(fft2(im[:, :, i])), filterimage)
-        im_recon[:, :, i] = ifft2(ifftshift(im_filtered[:, :, i])).real
-
-    # Scale between 0 and 255 for uint8
-    minval = np.min(im_recon)
-    maxval = np.max(im_recon)
-    im_recon_sc = (255 * ((im_recon - minval) / (maxval - minval))).astype(np.uint8)
-
-    # TODO: pre-m15, post-8ed cards
-    # TODO: pre-8ed cards (?)
-
-    # Borderify image
-    pad = 57  # Pad image by 1/8th of inch on each edge
-    bordertol = 16  # Overfill onto existing border by 16px to remove white corners
-    im_padded = np.zeros([im.shape[0] + 2 * pad, im.shape[1] + 2 * pad, 3])
-
-    # Get border colour from left side of image
-    bordercolour = np.median(im_recon_sc[200:(im_recon_sc.shape[0] - 200), 0:bordertol], axis=(0, 1))
+            leftPix, rightPix, topPix, bottomPix = box
+            im[topPix:bottomPix, leftPix:rightPix, :] = bordercolour
+            if box_ub:
+                leftPix, rightPix, topPix, bottomPix = box_ub
+                im[topPix:bottomPix, leftPix:rightPix, :] = bordercolour
 
     # Pad image
+    pad = 36 * UPSCALE_FACTOR  # Pad image by 1/8th of inch on each edge
+    bordertol = 32  # Overfill onto existing border by 90px to remove white corners
+    im_padded = np.zeros([im.shape[0] + 2 * pad, im.shape[1] + 2 * pad, 3])
+
     for i in range(0, 3):
-        im_padded[pad:im.shape[0] + pad, pad:im.shape[1] + pad, i] = im_recon_sc[:, :, i]
+        im_padded[pad : im.shape[0] + pad, pad : im.shape[1] + pad, i] = im[:, :, i]
 
     # Overfill onto existing border to remove white corners
     # Left
-    im_padded[0:im_padded.shape[0],
-              0:pad + bordertol, :] = bordercolour
+    im_padded[0 : im_padded.shape[0], 0 : pad + bordertol, :] = bordercolour
 
     # Right
-    im_padded[0:im_padded.shape[0],
-              im_padded.shape[1] - (pad + bordertol):im_padded.shape[1], :] = bordercolour
+    im_padded[
+        0 : im_padded.shape[0],
+        im_padded.shape[1] - (pad + bordertol) : im_padded.shape[1],
+        :,
+    ] = bordercolour
 
     # Top
-    im_padded[0:pad + bordertol,
-              0:im_padded.shape[1], :] = bordercolour
+    im_padded[0 : pad + bordertol, 0 : im_padded.shape[1], :] = bordercolour
 
     # Bottom
-    im_padded[im_padded.shape[0] - (pad + bordertol):im_padded.shape[0],
-              0:im_padded.shape[1], :] = bordercolour
-
-    # Remove copyright line
-    # print(card["power"])
-    if card["frame"] == "2015":
-        # Modern frame
-        leftPix = 735
-        rightPix = 1140
-        topPix = 1550
-        bottomPix = 1585
-
-        # creatures have a shifted legal line
-        try:
-            power = card["power"]
-            toughness = card["toughness"]
-            topPix = 1580
-            bottomPix = 1615
-            # Creature card
-        except KeyError:
-            pass
-
-        # planeswalkers have a shifted legal line too
-        try:
-            loyalty = card["loyalty"]
-            topPix = 1580
-            bottomPix = 1605
-        except KeyError:
-            pass
-
-        im_padded[topPix:bottomPix, leftPix:rightPix, :] = bordercolour
-
-    elif card["frame"] == "2003":
-        # 8ED frame
-        try:
-            loyalty = card["loyalty"]
-            leftPix = 300
-            rightPix = 960
-            topPix = 1570
-            bottomPix = 1600
-            im_padded[topPix:bottomPix, leftPix:rightPix, :] = bordercolour
-        except KeyError:
-            # TODO: Content aware fill?
-            pass
-
-    # Remove holostamp
-    if card["frame"] == "2015" and (card["rarity"] == "rare" or card["rarity"] == "mythic"):
-        # Need to remove holostamp
-        # Define bounds of ellipse to fill with border colour
-        leftE = 575
-        rightE = 690
-        topE = 1520
-        bottomE = 1575
-
-        cx = (leftE + rightE) / 2
-        cy = (topE + bottomE) / 2
-
-        h = (bottomE - topE) / 2
-        w = (rightE - leftE) / 2
-
-        for x in range(leftE, rightE + 1):
-            for y in range(topE, bottomE + 1):
-                # determine if point is in the holostamp area
-                if pow(x - cx, 2) / pow(w, 2) + pow(y - cy, 2) / pow(h, 2) <= 1:
-                    # point is inside ellipse
-                    im_padded[y, x, :] = bordercolour
+    im_padded[
+        im_padded.shape[0] - (pad + bordertol) : im_padded.shape[0],
+        0 : im_padded.shape[1],
+        :,
+    ] = bordercolour
 
     # Write image to disk
-    imageio.imwrite("formatted/" + cardname + ".png", im_padded.astype(np.uint8))
+    imageio.imwrite(formatted_path, im_padded.astype(np.uint8))
+    print(f"[[{cardname}]] Formatted image saved to disk")
 
 
 if __name__ == "__main__":
+    if not os.path.exists(FORMATTED_DIR):
+        os.makedirs(FORMATTED_DIR)
+    if not os.path.exists(CACHE_DIR):
+        os.makedirs(CACHE_DIR)
+
     # Loop through each card in cards.txt and scan em all
-    with open('cards.txt', 'r') as fp:
+    with open("cards.txt", "r") as fp:
         for cardname in fp:
-            process_card(cardname)
+            search_and_process_card(cardname)

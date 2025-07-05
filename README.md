@@ -1,28 +1,39 @@
 # mpc-scryfall
-Simple tool to retrieve Scryfall scans of MTG cards, perform some light processing on them, and prepare them for printing with MPC. This tool will throw Scryfall scans through waifu2x (courtesy of deepAI), lightly filter the image, then remove the holographic stamp.
 
-![img1](https://i.imgur.com/gLBAYFL.png)
+*Adapted from [woogerboy21/mpc-scryfall](https://github.com/woogerboy21/mpc-scryfall).*
 
-# Requirements
-* An internet connection while the tool is running
-* A deepAI.org account (free) 
-* Python 3
-* The Python 3 packages:
-   * Scrython
-   * imageio
-   * requests
-   * numpy
-   * scikit-image
+Simple tool to retrieve Scryfall scans of MTG cards, upscale the image using [real-esrgan](https://replicate.com/nightmareai/real-esrgan), and remove the copyright and holographic stamp to get the image ready for MPC. 
 
-# Install / Usage Guide
-* Download the script and filter image somewhere on your computer
-* Create a file called `config.py` in the same folder. Its contents should be the line `TOKEN = '<your token from deepAI.org>'`, excluding the <>'s.
-* Create a folder called `formatted` in the same location
-* Create a text file called `cards.txt` and put the card names you want to scan in it, one on each line. Optionally, specify the version of the card you want; for example, `Sulfuric Vortex|CNS`
-* To scan each card in `cards.txt`, run `scryfall_formatter.py`
-* To do entire sets at a time, run `scryfall_formatter_set.py` and type in the three-character set code for the set you want when prompted
-* If you're on a Mac and get an error talking about certificate verification failing, go to Applications -> Python 3.X and run `Install Certificates.command`, and that should fix it!
-* If you get an error that looks something like `KeyError: 'output_url'`, double check that you've received and confirmed your deepAI account by email
+For sample results, see the images in the [sample_outputs](./sample_outputs) folder.
 
-# Limitations / Other Notes
-This can work on any magic card scan, but it'll only attempt to do post-filtering cleanup on planeswalkers and any cards printed in the M15 onwards frame. I also haven't tried printing any cards yet with this, but I placed some of the resulting images into MPC and the crops looked fine.
+![How to use GIF](repo_assets/usage.gif)
+
+## Requirements
+
+* Basic knowledge on how to run Python.
+* An internet connection (it uses Scryfall and Replicate APIs).
+* A Replicate account for upscaling the images. Creeating an account is free, but you need to pay around 1$ every 100 requests (you only have to do it once per image).
+
+## Usage Guide
+
+1) Install the python packages listed in `requirements.txt`.
+1) List all the cards that you want to download in the `cards.txt` file at the root of the repository.
+1) In a terminal run `export REPLICATE_API_TOKEN=<YOUR_API_TOKEN>`.     
+1) Run `python scryfall_formatter.py`.
+
+
+## FAQ
+
+### How to Search for a Specific Version or Set of a Card
+
+**Set-specific searches**: To search within a particular set, add `s:` after the card name followed by the set code.
+
+* Example: `Arcane Signet s:FIC`.
+
+**Version-specific searches**: To select a specific version, use both `s:` for the set followed by `cn:` for the version number after the card name.
+
+* Example: `Yuriko, the Tiger's Shadow s:CMM cn:690`
+
+### Why are output images from Replicate cached?
+
+In case you want to modify the posprocessing logic without the need of calling Replicate's API on every script execution. For example, you might decide that you want to use a different way of removing the copyright and the holographic stamp.

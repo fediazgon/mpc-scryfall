@@ -1,0 +1,5 @@
+Buster Sword s:FIN cn:0255
+Cloud, Midgar Mercenary s:FIN cn:0520
+Giada, Font of Hope s:FDN cn:298
+Sephiroth, Fabled SOLDIER s:FIN
+Tezzeret, Cruel Captain
